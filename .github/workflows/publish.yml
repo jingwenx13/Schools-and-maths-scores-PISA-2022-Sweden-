@@ -15,7 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: quarto-dev/quarto-actions/setup@v2
-      - uses: quarto-dev/quarto-actions/render@v2
+      - name: Render Quarto
+        run: quarto render project1_pisa_multilevel.qmd --output-dir _site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
