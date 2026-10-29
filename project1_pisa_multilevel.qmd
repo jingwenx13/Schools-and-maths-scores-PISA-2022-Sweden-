@@ -1,0 +1,290 @@
+---
+title: "Why do maths scores differ between schools?"
+subtitle: "Multilevel models of PISA 2022 maths achievement in Sweden"
+author: "Jingwen Xiong"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(haven)
+library(here)
+library(lme4)
+library(lmerTest)      # Satterthwaite p-values for lmer
+library(performance)   # ICC, R2, singularity checks
+library(modelsummary)
+library(broom.mixed)
+
+theme_set(theme_minimal(base_size = 12))
+pct <- function(x, d = 1) sprintf("%.*f%%", d, 100 * x)
+```
+
+## Summary
+
+> **TODO: write last, 3 to 4 sentences for a non-specialist.** Cover: how much of the variation in 15-year-olds' maths scores lies between schools, what individual and family characteristics explain, and whether the link between weekly maths classes and scores differs from school to school. Use the numbers from the results below, not from the exam script.
+
+## 1. Question
+
+Students are nested in schools, so some of the differences in maths scores are differences *between schools* rather than between individual students. This project asks:
+
+1. How much of the variation in maths scores sits between schools?
+2. Do weekly maths classes, gender and parental university education predict scores?
+3. Does the association between maths classes and scores **vary across schools**?
+
+## 2. Data
+
+PISA 2022, Sweden. Each row is one 15-year-old student (`CNTSTUID`) nested in a sampled school (`CNTSCHID`).
+
+| Variable | Role | Coding |
+|---|---|---|
+| `SCORE_MATH` | Outcome | Maths test score |
+| `MATHSCLA` | Predictor | Maths classes per week (continuous) |
+| `SEX` | Predictor | Recoded to `female` (1 = female, 0 = male) |
+| `PARUNI` | Predictor | 1 = at least one parent completed university |
+
+::: {.callout-warning}
+## Data note: read before running
+
+The variable names above come from the course extract used in my exam. That extract is course material, so **it is not included in this repository**. To reproduce this analysis, download the public PISA 2022 student file from the OECD and map the variables below to the equivalents in the codebook (for example the maths plausible value, student sex, and a parental-education indicator derived from highest parental ISCED level). **Verify each variable name against the PISA 2022 codebook before running.**
+:::
+
+```{r}
+#| label: load-data
+# TODO: point this at your own local copy of the public PISA 2022 file.
+# Keep raw data out of version control (add data/ to .gitignore).
+pisa_raw <- read_dta(here("data", "pisa_2022_swe.dta"))
+
+# TODO: rename public variables to the names used below.
+pisa_raw <- pisa_raw |>
+  transmute(
+    school     = CNTSCHID,
+    student    = CNTSTUID,
+    math       = SCORE_MATH,
+    mathsclass = MATHSCLA,
+    female     = as.integer(SEX == 1),
+    paruni     = PARUNI
+  )
+
+# Analysis sample: complete cases on all model variables
+pisa <- pisa_raw |>
+  drop_na() |>
+  mutate(
+    school       = factor(school),
+    mathsclass_c = mathsclass - mean(mathsclass)  # grand-mean centred
+  )
+```
+
+### 2.1 Sample size
+
+```{r}
+#| label: descriptives
+school_sizes <- pisa |> count(school, name = "n_students")
+
+desc <- tibble(
+  `Students (analysis sample)` = nrow(pisa),
+  `Schools`                    = nrow(school_sizes),
+  `Mean students per school`   = round(mean(school_sizes$n_students), 1),
+  `Min / max per school`       = paste(min(school_sizes$n_students), "/", max(school_sizes$n_students))
+)
+knitr::kable(desc)
+```
+
+## 3. Method
+
+I use **multilevel (mixed-effects) linear models** because students in the same school are not independent. A single-level regression would understate standard errors and could not tell us how much variation sits at school level.
+
+The models build up in steps:
+
+| Model | Specification | Purpose |
+|---|---|---|
+| M0 | Null (random intercept only) | Intraclass correlation (ICC) |
+| M1 | + maths classes + female | Test H1 and H2 |
+| M2 | + parental university | Test H3; compositional effects |
+| M3 | M2 with random slope for maths classes | Test H4 |
+
+`mathsclass` is grand-mean centred so the intercept refers to a student with the average number of maths classes, and the random intercept and random slope are less strongly correlated by construction.
+
+## 4. Results
+
+### 4.1 How much variation is between schools?
+
+```{r}
+#| label: m0
+m0 <- lmer(math ~ 1 + (1 | school), data = pisa)
+icc_m0 <- icc(m0)$ICC_adjusted
+```
+
+The ICC from the null model is **`r pct(icc_m0)`**: that share of the total variation in maths scores lies between schools.
+
+### 4.2 Maths classes and gender (M1)
+
+```{r}
+#| label: m1
+m1 <- lmer(math ~ mathsclass_c + female + (1 | school), data = pisa)
+```
+
+### 4.3 Adding parental university education (M2)
+
+```{r}
+#| label: m2
+m2 <- lmer(math ~ mathsclass_c + female + paruni + (1 | school), data = pisa)
+
+modelsummary(
+  list("M1" = m1, "M2" = m2),
+  stars = TRUE, statistic = "std.error", gof_omit = "AIC|BIC|Log|RMSE",
+  coef_rename = c(mathsclass_c = "Maths classes per week (centred)",
+                  female = "Female", paruni = "Parent completed university")
+)
+```
+
+**TODO: interpret.** Describe the direction and size of each coefficient in plain English. Suggested points:
+
+- The maths-classes coefficient may be negative. Do not read this causally: weaker students are often given extra maths lessons, so the association likely reflects selection or reverse causation.
+- State clearly whether each hypothesis (H1: more classes, higher scores; H2: girls score higher; H3: parental university, higher scores) is supported.
+
+### 4.4 How much variance do the predictors explain?
+
+R² at each level is the **proportional reduction in variance relative to the null model (M0)**, not the share of variance that sits at each level.
+
+```{r}
+#| label: r2
+var_parts <- function(m) {
+  v <- as.data.frame(VarCorr(m))
+  c(school = v$vcov[v$grp == "school"][1],
+    resid  = v$vcov[v$grp == "Residual"])
+}
+
+v0 <- var_parts(m0)
+
+r2_table <- map_dfr(list(M1 = m1, M2 = m2), function(m) {
+  v <- var_parts(m)
+  tibble(
+    `Level 1 R2 (students)` = 1 - v["resid"]  / v0["resid"],
+    `Level 2 R2 (schools)`  = 1 - v["school"] / v0["school"]
+  )
+}, .id = "Model") |>
+  mutate(across(starts_with("Level"), ~ round(100 * .x, 1)))
+
+knitr::kable(r2_table, caption = "Proportional reduction in variance vs null model (%)")
+
+# Cross-check
+r2_nakagawa(m1)
+```
+
+**TODO: interpret.** Expect very small values for M1: maths classes and gender explain little of the variation at either level. Note that an ICC (variance share) and an R² (variance explained) are different quantities.
+
+### 4.5 Compositional effects: what happens to school-level variance when PARUNI enters?
+
+```{r}
+#| label: composition
+tau <- tibble(
+  Model = c("M1", "M2"),
+  `School-level variance` = c(var_parts(m1)["school"], var_parts(m2)["school"])
+)
+knitr::kable(tau, digits = 1)
+```
+
+**TODO: interpret.** If school-level variance falls, part of the apparent between-school difference was due to schools enrolling different mixes of students (a **compositional effect**), not to anything about the schools themselves.
+
+### 4.6 Does the maths-classes slope vary across schools? (M3)
+
+```{r}
+#| label: m3
+m3 <- lmer(
+  math ~ mathsclass_c + female + paruni + (1 + mathsclass_c | school),
+  data = pisa,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+isSingular(m3)   # TRUE would signal an over-parameterised random-effects structure
+VarCorr(m3)
+```
+
+**Likelihood ratio test** against the random-intercept model (same fixed effects, so the REML fits are comparable):
+
+```{r}
+#| label: lrt
+lrt <- anova(m3, m2, refit = FALSE)
+lrt
+
+# The null puts the slope variance on the boundary of the parameter space, so the
+# plain chi-square p-value is conservative. Use a 50:50 mixture of chi2(1) and chi2(2):
+stat <- lrt$Chisq[2]
+p_mix <- 0.5 * pchisq(stat, 1, lower.tail = FALSE) +
+         0.5 * pchisq(stat, 2, lower.tail = FALSE)
+p_mix
+```
+
+**TODO: interpret.** Cover:
+
+- The slope standard deviation: how much the maths-classes association varies from school to school, in score points.
+- The intercept-slope correlation: a negative correlation means schools with higher average scores have *more negative* slopes. Be explicit about the direction, and be cautious if the model is singular or the correlation sits near -1.
+- The plain-English conclusion on H4.
+
+### 4.7 Figures
+
+```{r}
+#| label: fig-caterpillar
+#| fig-cap: "School-level random intercepts (M2) with 95% intervals. Schools whose interval excludes zero differ from the Swedish average after accounting for the predictors."
+re <- as.data.frame(ranef(m2, condVar = TRUE)) |>
+  mutate(school = fct_reorder(grp, condval),
+         lo = condval - 1.96 * condsd,
+         hi = condval + 1.96 * condsd)
+
+ggplot(re, aes(x = condval, y = school)) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), size = 0.15) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_y_discrete(labels = NULL) +
+  labs(x = "School deviation from average maths score", y = "Schools (ranked)")
+```
+
+```{r}
+#| label: fig-slopes
+#| fig-cap: "School-specific slopes for weekly maths classes (M3): fixed effect plus each school's random deviation."
+slopes <- as.data.frame(ranef(m3)$school) |>
+  rownames_to_column("school") |>
+  mutate(slope = fixef(m3)["mathsclass_c"] + mathsclass_c)
+
+ggplot(slopes, aes(x = slope)) +
+  geom_histogram(bins = 25, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = fixef(m3)["mathsclass_c"], linetype = 2) +
+  labs(x = "Estimated slope: score change per extra weekly maths class",
+       y = "Number of schools")
+```
+
+## 5. Interpretation
+
+**TODO:** 2 to 3 short paragraphs in plain English linking results to the three questions, with no new numbers here.
+
+## 6. Limitations
+
+- **Observational data.** Associations are not causal. The maths-classes coefficient in particular is likely affected by selection (struggling students may receive more lessons).
+- **Sampling design.** This analysis does not use PISA's survey weights or its multiple plausible values for maths. Estimates and standard errors would change with them (see the OECD PISA data analysis manual).
+- **Random-slope model.** Slope variance and the intercept-slope correlation are hard to estimate with about 24 students per school; check for singularity and treat the correlation cautiously.
+- **Single country, single cohort.**
+
+## 7. Reproducibility
+
+```{r}
+#| label: session
+sessionInfo()
+```
+
+Repository layout (suggested):
+
+```
+project1/
+  project1_pisa_multilevel.qmd
+  data/            # not committed; see data note
+  README.md        # data source, how to run, variable mapping
+```
